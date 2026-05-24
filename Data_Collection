@@ -1,0 +1,1408 @@
+"""
+PumpPortal 5–10 Minute Tradebot Research Collector
+==================================================
+
+Purpose:
+- Collect new PumpPortal launches for 1 hour.
+- Track each selected launch until 5 minutes.
+- At 5:00, tag candidates by market-cap tiers:
+    Tier 1: $5,000+
+    Tier 2: $7,500+
+    Tier 3: $10,000+
+- Continue tracking only candidates from 5:00 to 10:00.
+- Save detailed 15-second snapshots into pump_token_snapshots.
+- Save a clean summary into pump_5_10_trade_research_results.
+- Analyse whether each candidate reached +15%, +20%, or +30% before 10 minutes.
+- Analyse creator behaviour: creator sold, sell volume, previous launches, previous migrations.
+
+Important:
+- This script does NOT place trades.
+- This is for data collection, descriptive analysis, and paper-trading research.
+"""
+
+import asyncio
+import json
+import time
+from datetime import datetime
+from typing import Any, Dict, Optional, Set, List
+
+import mysql.connector
+import websockets
+
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+MYSQL_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "9677368753",
+    "port": 3306,
+    "database": "pump_portal_1",
+}
+
+PUMPPORTAL_API_KEY = "c94k6wb58d372j9fatqmmpjc6d574rup6rr4cckq8mr52wthet136gjtcnb32d315duk0kv389970rk1dt8n2gbp9hr6mwbb6x9mahju85v78k3ed9546ta8chw50y9b6da5jvbda4ykudhp4pkkfe1c4pthnad7q6j3heg8t448k3g95q70pkcexb68vkd6nr78gkg6xvkuf8"
+PUMPPORTAL_URL = f"wss://pumpportal.fun/api/data?api-key={PUMPPORTAL_API_KEY}"
+
+# Update this manually before each run if SOL price changes.
+SOL_USD_PRICE_MANUAL = 180.0
+
+COLLECTION_RUN_ID = datetime.now().strftime("five_to_ten_run_%Y_%m_%d_%H_%M_%S")
+
+# Collect new launches for 1 hour.
+LAUNCH_COLLECTION_SECONDS = 3600
+
+# Main research thresholds.
+THRESHOLD_5K = 5_000
+THRESHOLD_7500 = 7_500
+THRESHOLD_10K = 10_000
+
+# Profit targets after the 5-minute entry point.
+PROFIT_TARGETS = [15, 20, 30]
+
+# Stop-loss examples for later analysis.
+# The script records whether the coin dropped below these drawdown levels.
+STOP_LOSS_LEVELS = [-15, -20, -30]
+
+# The key research windows.
+FIVE_MIN_SECONDS = 300
+TEN_MIN_SECONDS = 600
+
+# Snapshot windows:
+# - early checkpoints at 1m and 2m
+# - exact 15-second windows from 5:00 to 10:00
+SNAPSHOT_WINDOWS = [
+    60, 120,
+    300, 315, 330, 345,
+    360, 375, 390, 405,
+    420, 435, 450, 465,
+    480, 495, 510, 525,
+    540, 555, 570, 585,
+    600
+]
+
+# Cost / load protection.
+# If True, every launch will be tracked until 5 minutes, up to the limits below.
+TRACK_ALL_LAUNCHES_UNTIL_5_MIN = True
+
+# Start smaller if your PumpPortal balance is low.
+MAX_TOTAL_TRACKED_TOKENS = 300
+MAX_ACTIVE_TRACKED_TOKENS = 80
+
+# If TRACK_ALL_LAUNCHES_UNTIL_5_MIN = False, this lightweight filter is used.
+MIN_LAUNCH_MARKET_CAP_SOL_TO_TRACK = 20
+MIN_SOL_AMOUNT_TO_TRACK = 0.05
+
+
+# =====================================================
+# MYSQL CONNECTION
+# =====================================================
+
+mydb = mysql.connector.connect(**MYSQL_CONFIG)
+cursor = mydb.cursor(dictionary=True)
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+
+def now_datetime() -> datetime:
+    return datetime.now()
+
+
+def clean_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value if value else None
+
+
+def lower_text(value: Any) -> Optional[str]:
+    value = clean_text(value)
+    return value.lower() if value else None
+
+
+def to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def to_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        return value.lower() in ["true", "1", "yes"]
+    return None
+
+
+def market_cap_usd_from_sol(market_cap_sol: Optional[float]) -> Optional[float]:
+    if market_cap_sol is None:
+        return None
+    return float(market_cap_sol) * float(SOL_USD_PRICE_MANUAL)
+
+
+def calculate_price_sol(sol_amount: Any, token_amount: Any) -> Optional[float]:
+    sol = to_float(sol_amount)
+    tokens = to_float(token_amount)
+    if sol is None or tokens is None or tokens == 0:
+        return None
+    return sol / tokens
+
+
+def calculate_ratio(numerator: Any, denominator: Any) -> Optional[float]:
+    n = float(numerator or 0)
+    d = float(denominator or 0)
+    if d == 0:
+        return n if n > 0 else None
+    return n / d
+
+
+def get_launch_time_parts(received_at: datetime):
+    return received_at.date(), received_at.hour, received_at.weekday() + 1
+
+
+def threshold_flags(mc_usd: float) -> Dict[str, bool]:
+    return {
+        "passed_5k": mc_usd >= THRESHOLD_5K,
+        "passed_7500": mc_usd >= THRESHOLD_7500,
+        "passed_10k": mc_usd >= THRESHOLD_10K,
+    }
+
+
+def threshold_label(mc_usd: float) -> str:
+    if mc_usd >= THRESHOLD_10K:
+        return "10k_plus"
+    if mc_usd >= THRESHOLD_7500:
+        return "7500_plus"
+    if mc_usd >= THRESHOLD_5K:
+        return "5k_plus"
+    return "below_5k"
+
+
+# =====================================================
+# REQUIRED TABLES + RESEARCH TABLE
+# =====================================================
+
+REQUIRED_TABLES = [
+    "raw_events",
+    "creators",
+    "launches",
+    "migrations",
+    "pump_tracked_tokens",
+    "pump_paid_raw_events",
+    "pump_token_trades",
+    "pump_token_snapshots",
+]
+
+
+def check_required_tables():
+    cursor.execute("SHOW TABLES")
+    existing = {list(row.values())[0] for row in cursor.fetchall()}
+    missing = [table for table in REQUIRED_TABLES if table not in existing]
+    if missing:
+        raise Exception(f"Missing required tables: {missing}")
+    print("Required tables exist.")
+
+
+def ensure_research_result_table():
+    """
+    This table is a clean summary table for the 5–10 minute strategy.
+    Detailed checkpoints are still saved into pump_token_snapshots.
+    """
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pump_5_10_trade_research_results (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+
+        collection_run_id VARCHAR(100) NOT NULL,
+        mint VARCHAR(255) NOT NULL,
+        token_name VARCHAR(255),
+        symbol VARCHAR(100),
+        creator_wallet VARCHAR(255),
+        launch_time DATETIME,
+
+        entry_time_seconds INT DEFAULT 300,
+        entry_market_cap_sol DECIMAL(40,10),
+        entry_market_cap_usd DECIMAL(40,10),
+        entry_threshold_label VARCHAR(50),
+
+        passed_5k BOOLEAN DEFAULT FALSE,
+        passed_7500 BOOLEAN DEFAULT FALSE,
+        passed_10k BOOLEAN DEFAULT FALSE,
+
+        entry_buy_count INT DEFAULT 0,
+        entry_sell_count INT DEFAULT 0,
+        entry_unique_buyers INT DEFAULT 0,
+        entry_unique_sellers INT DEFAULT 0,
+        entry_buy_volume_sol DECIMAL(40,10) DEFAULT 0,
+        entry_sell_volume_sol DECIMAL(40,10) DEFAULT 0,
+        entry_net_volume_sol DECIMAL(40,10) DEFAULT 0,
+        entry_top_buyer_share_percent DECIMAL(20,8),
+        entry_top_seller_share_percent DECIMAL(20,8),
+        entry_creator_sold BOOLEAN DEFAULT FALSE,
+        entry_creator_sell_volume_sol DECIMAL(40,10) DEFAULT 0,
+        creator_previous_launches INT DEFAULT 0,
+        creator_previous_migrations INT DEFAULT 0,
+        entry_risk_score DECIMAL(20,8),
+        entry_momentum_score DECIMAL(20,8),
+
+        max_market_cap_usd_5_to_10 DECIMAL(40,10),
+        min_market_cap_usd_5_to_10 DECIMAL(40,10),
+        best_return_percent_5_to_10 DECIMAL(20,8),
+        worst_drawdown_percent_5_to_10 DECIMAL(20,8),
+        best_exit_seconds INT,
+        best_exit_label VARCHAR(50),
+
+        hit_plus_15 BOOLEAN DEFAULT FALSE,
+        hit_plus_20 BOOLEAN DEFAULT FALSE,
+        hit_plus_30 BOOLEAN DEFAULT FALSE,
+        first_hit_15_seconds INT,
+        first_hit_20_seconds INT,
+        first_hit_30_seconds INT,
+
+        hit_stop_minus_15 BOOLEAN DEFAULT FALSE,
+        hit_stop_minus_20 BOOLEAN DEFAULT FALSE,
+        hit_stop_minus_30 BOOLEAN DEFAULT FALSE,
+        first_stop_15_seconds INT,
+        first_stop_20_seconds INT,
+        first_stop_30_seconds INT,
+
+        dropped_below_5k BOOLEAN DEFAULT FALSE,
+        dropped_below_7500 BOOLEAN DEFAULT FALSE,
+        dropped_below_10k BOOLEAN DEFAULT FALSE,
+
+        final_10m_market_cap_usd DECIMAL(40,10),
+        final_10m_return_percent DECIMAL(20,8),
+        final_10m_above_5k BOOLEAN DEFAULT NULL,
+        final_10m_above_7500 BOOLEAN DEFAULT NULL,
+        final_10m_above_10k BOOLEAN DEFAULT NULL,
+
+        final_status VARCHAR(100),
+        notes TEXT,
+
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+        UNIQUE KEY unique_run_mint (collection_run_id, mint),
+        INDEX idx_run (collection_run_id),
+        INDEX idx_mint (mint),
+        INDEX idx_creator_wallet (creator_wallet),
+        INDEX idx_threshold_label (entry_threshold_label),
+        INDEX idx_passed_5k (passed_5k),
+        INDEX idx_passed_7500 (passed_7500),
+        INDEX idx_passed_10k (passed_10k),
+        INDEX idx_hit_plus_15 (hit_plus_15),
+        INDEX idx_hit_plus_20 (hit_plus_20),
+        INDEX idx_hit_plus_30 (hit_plus_30)
+    )
+    """)
+    mydb.commit()
+    print("pump_5_10_trade_research_results is ready.")
+
+
+# =====================================================
+# DATABASE INSERTS: LAUNCHES / CREATORS / MIGRATIONS
+# =====================================================
+
+def save_raw_event(event_type: str, mint: Optional[str], received_at: datetime, data: dict) -> int:
+    if event_type not in ["launch", "migration", "unknown"]:
+        event_type = "unknown"
+
+    cursor.execute("""
+    INSERT INTO raw_events (event_type, mint, received_at, raw_json)
+    VALUES (%s, %s, %s, %s)
+    """, (event_type, mint, received_at, json.dumps(data, ensure_ascii=False)))
+    mydb.commit()
+    return int(cursor.lastrowid)
+
+
+def get_creator_previous_stats(creator_wallet: Optional[str]):
+    if not creator_wallet:
+        return 0, 0
+
+    cursor.execute("""
+    SELECT total_launches, total_migrations
+    FROM creators
+    WHERE creator_wallet = %s
+    LIMIT 1
+    """, (creator_wallet,))
+    row = cursor.fetchone()
+
+    if not row:
+        return 0, 0
+
+    return int(row["total_launches"] or 0), int(row["total_migrations"] or 0)
+
+
+def ensure_creator_exists(creator_wallet: str, seen_at: datetime):
+    cursor.execute("""
+    INSERT INTO creators (creator_wallet, first_seen_at, last_seen_at, total_launches, total_migrations)
+    VALUES (%s, %s, %s, 0, 0)
+    ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)
+    """, (creator_wallet, seen_at, seen_at))
+    mydb.commit()
+
+
+def increase_creator_launch_count(creator_wallet: str, seen_at: datetime):
+    cursor.execute("""
+    UPDATE creators
+    SET total_launches = total_launches + 1, last_seen_at = %s
+    WHERE creator_wallet = %s
+    """, (seen_at, creator_wallet))
+    mydb.commit()
+
+
+def increase_creator_migration_count(creator_wallet: str, seen_at: datetime):
+    cursor.execute("""
+    UPDATE creators
+    SET total_migrations = total_migrations + 1, last_seen_at = %s
+    WHERE creator_wallet = %s
+    """, (seen_at, creator_wallet))
+    mydb.commit()
+
+
+def get_duplicate_counts(name_lower: Optional[str], symbol_lower: Optional[str]):
+    duplicate_name_count = 0
+    duplicate_symbol_count = 0
+
+    if name_lower:
+        cursor.execute("SELECT COUNT(*) AS total FROM launches WHERE name_lower = %s", (name_lower,))
+        duplicate_name_count = int(cursor.fetchone()["total"] or 0)
+
+    if symbol_lower:
+        cursor.execute("SELECT COUNT(*) AS total FROM launches WHERE symbol_lower = %s", (symbol_lower,))
+        duplicate_symbol_count = int(cursor.fetchone()["total"] or 0)
+
+    return duplicate_name_count, duplicate_symbol_count
+
+
+def save_launch(data: dict, raw_event_id: int, received_at: datetime) -> Optional[Dict[str, Any]]:
+    mint = data.get("mint")
+    creator_wallet = data.get("traderPublicKey")
+
+    if not mint or not creator_wallet:
+        print("Skipped launch: missing mint or creator wallet.")
+        return None
+
+    name = clean_text(data.get("name"))
+    symbol = clean_text(data.get("symbol"))
+    name_lower = lower_text(name)
+    symbol_lower = lower_text(symbol)
+
+    launch_date, launch_hour, launch_day_of_week = get_launch_time_parts(received_at)
+    duplicate_name_count, duplicate_symbol_count = get_duplicate_counts(name_lower, symbol_lower)
+    creator_previous_launches, creator_previous_migrations = get_creator_previous_stats(creator_wallet)
+
+    ensure_creator_exists(creator_wallet, received_at)
+
+    sol_amount = to_float(data.get("solAmount"))
+    initial_buy = to_float(data.get("initialBuy"))
+    market_cap_sol = to_float(data.get("marketCapSol"))
+    is_mayhem_mode = to_bool(
+        data.get("is_mayhem_mode") if data.get("is_mayhem_mode") is not None else data.get("isMayhemMode")
+    )
+
+    cursor.execute("""
+    INSERT IGNORE INTO launches (
+        mint, name, symbol, creator_wallet, launch_time, received_at, raw_event_id,
+        name_lower, symbol_lower, launch_date, launch_hour, launch_day_of_week,
+        duplicate_name_count_at_launch, duplicate_symbol_count_at_launch,
+        sol_amount, initial_buy, market_cap_sol, bonding_curve_key,
+        v_tokens_in_bonding_curve, v_sol_in_bonding_curve, is_mayhem_mode,
+        pool, uri
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        mint, name, symbol, creator_wallet, received_at, received_at, raw_event_id,
+        name_lower, symbol_lower, launch_date, launch_hour, launch_day_of_week,
+        duplicate_name_count, duplicate_symbol_count,
+        sol_amount, initial_buy, market_cap_sol, data.get("bondingCurveKey"),
+        to_float(data.get("vTokensInBondingCurve")),
+        to_float(data.get("vSolInBondingCurve")),
+        is_mayhem_mode, data.get("pool"), data.get("uri")
+    ))
+    mydb.commit()
+
+    if cursor.rowcount == 1:
+        increase_creator_launch_count(creator_wallet, received_at)
+        print("Launch saved:", name, "|", symbol, "| MC SOL:", market_cap_sol, "| mint:", mint)
+
+    return {
+        "mint": mint,
+        "name": name,
+        "symbol": symbol,
+        "creator_wallet": creator_wallet,
+        "launch_time": received_at,
+        "sol_amount": sol_amount,
+        "initial_buy": initial_buy,
+        "market_cap_sol": market_cap_sol,
+        "bonding_curve_key": data.get("bondingCurveKey"),
+        "v_tokens_in_bonding_curve": to_float(data.get("vTokensInBondingCurve")),
+        "v_sol_in_bonding_curve": to_float(data.get("vSolInBondingCurve")),
+        "is_mayhem_mode": is_mayhem_mode,
+        "pool": data.get("pool"),
+        "duplicate_name_count": duplicate_name_count,
+        "duplicate_symbol_count": duplicate_symbol_count,
+        "creator_previous_launches": creator_previous_launches,
+        "creator_previous_migrations": creator_previous_migrations,
+        "raw_json": json.dumps(data, ensure_ascii=False),
+    }
+
+
+def save_migration(data: dict, raw_event_id: int, received_at: datetime):
+    mint = data.get("mint")
+    if not mint:
+        return
+
+    cursor.execute("SELECT launch_time, creator_wallet FROM launches WHERE mint = %s LIMIT 1", (mint,))
+    launch_row = cursor.fetchone()
+    if not launch_row:
+        return
+
+    launch_time = launch_row["launch_time"]
+    creator_wallet = launch_row["creator_wallet"]
+
+    minutes_from_launch = None
+    if launch_time:
+        minutes_from_launch = int((received_at - launch_time).total_seconds() // 60)
+
+    cursor.execute("""
+    INSERT IGNORE INTO migrations (mint, migration_time, received_at, raw_event_id, minutes_from_launch, migration_status)
+    VALUES (%s, %s, %s, %s, %s, 'confirmed')
+    """, (mint, received_at, received_at, raw_event_id, minutes_from_launch))
+    mydb.commit()
+
+    if cursor.rowcount == 1:
+        cursor.execute("""
+        UPDATE launches
+        SET is_migrated = TRUE, migration_time = %s, minutes_to_migration = %s
+        WHERE mint = %s
+        """, (received_at, minutes_from_launch, mint))
+        mydb.commit()
+
+        if creator_wallet:
+            increase_creator_migration_count(creator_wallet, received_at)
+
+        cursor.execute("""
+        UPDATE pump_5_10_trade_research_results
+        SET final_status = COALESCE(final_status, 'migrated')
+        WHERE mint = %s
+        """, (mint,))
+        mydb.commit()
+
+        print("Migration saved:", mint, "| minutes:", minutes_from_launch)
+
+
+# =====================================================
+# TRACKED TOKENS / TRADES
+# =====================================================
+
+def insert_tracked_token(info: Dict[str, Any], tracking_reason: str) -> Optional[int]:
+    cursor.execute("""
+    INSERT IGNORE INTO pump_tracked_tokens (
+        collection_run_id, mint, token_name, symbol, creator_wallet, launch_time,
+        tracking_started_at, launch_score, tracking_reason, sol_amount, initial_buy,
+        market_cap_sol, bonding_curve_key, v_tokens_in_bonding_curve,
+        v_sol_in_bonding_curve, is_mayhem_mode, pool, duplicate_name_count,
+        duplicate_symbol_count, creator_previous_launches, creator_previous_migrations,
+        tracking_status, raw_json
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s)
+    """, (
+        COLLECTION_RUN_ID, info["mint"], info["name"], info["symbol"], info["creator_wallet"],
+        info["launch_time"], now_datetime(), tracking_reason, info["sol_amount"],
+        info["initial_buy"], info["market_cap_sol"], info["bonding_curve_key"],
+        info["v_tokens_in_bonding_curve"], info["v_sol_in_bonding_curve"],
+        info["is_mayhem_mode"], info["pool"], info["duplicate_name_count"],
+        info["duplicate_symbol_count"], info["creator_previous_launches"],
+        info["creator_previous_migrations"], info["raw_json"]
+    ))
+    mydb.commit()
+
+    cursor.execute("""
+    SELECT id
+    FROM pump_tracked_tokens
+    WHERE mint = %s AND collection_run_id = %s
+    LIMIT 1
+    """, (info["mint"], COLLECTION_RUN_ID))
+    row = cursor.fetchone()
+
+    return int(row["id"]) if row else None
+
+
+def complete_tracked_token(mint: str):
+    cursor.execute("""
+    UPDATE pump_tracked_tokens
+    SET tracking_status = 'completed', tracking_ended_at = %s
+    WHERE mint = %s AND collection_run_id = %s
+    """, (now_datetime(), mint, COLLECTION_RUN_ID))
+    mydb.commit()
+
+
+def save_paid_raw_event(event_type: str, mint: Optional[str], signature: Optional[str], data: dict) -> int:
+    cursor.execute("""
+    INSERT INTO pump_paid_raw_events (collection_run_id, event_type, mint, signature, raw_json)
+    VALUES (%s, %s, %s, %s, %s)
+    """, (COLLECTION_RUN_ID, event_type, mint, signature, json.dumps(data, ensure_ascii=False)))
+    mydb.commit()
+
+    return int(cursor.lastrowid)
+
+
+def save_token_trade(
+    data: dict,
+    tracked_token_id_by_mint: Dict[str, int],
+    launch_time_ts_by_mint: Dict[str, float],
+    trade_sequence_by_mint: Dict[str, int],
+):
+    mint = data.get("mint")
+    signature = data.get("signature")
+    tx_type = data.get("txType")
+
+    raw_event_id = save_paid_raw_event(tx_type, mint, signature, data)
+
+    token_amount = data.get("tokenAmount") or data.get("initialBuy")
+    sol_amount = data.get("solAmount")
+    price_sol = calculate_price_sol(sol_amount, token_amount)
+
+    launch_ts = launch_time_ts_by_mint.get(mint)
+    seconds_after_launch = round(time.time() - launch_ts, 3) if launch_ts else None
+
+    trade_sequence_by_mint[mint] = trade_sequence_by_mint.get(mint, 0) + 1
+
+    cursor.execute("""
+    INSERT IGNORE INTO pump_token_trades (
+        collection_run_id, tracked_token_id, signature, mint, trader_public_key, tx_type,
+        token_amount, sol_amount, price_sol, bonding_curve_key, v_tokens_in_bonding_curve,
+        v_sol_in_bonding_curve, market_cap_sol, trade_sequence, seconds_after_launch,
+        pool, raw_event_id, raw_json
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        COLLECTION_RUN_ID, tracked_token_id_by_mint.get(mint), signature, mint,
+        data.get("traderPublicKey"), tx_type, to_float(token_amount), to_float(sol_amount),
+        price_sol, data.get("bondingCurveKey"), to_float(data.get("vTokensInBondingCurve")),
+        to_float(data.get("vSolInBondingCurve")), to_float(data.get("marketCapSol")),
+        trade_sequence_by_mint[mint], seconds_after_launch, data.get("pool"), raw_event_id,
+        json.dumps(data, ensure_ascii=False)
+    ))
+    mydb.commit()
+
+
+# =====================================================
+# SNAPSHOT CALCULATION
+# =====================================================
+
+def save_snapshot(mint: str, tracked_token_id: int, seconds_after_launch: int) -> Optional[Dict[str, Any]]:
+    cursor.execute("SELECT * FROM pump_tracked_tokens WHERE id = %s LIMIT 1", (tracked_token_id,))
+    tracked = cursor.fetchone()
+    if not tracked:
+        return None
+
+    creator_wallet = tracked.get("creator_wallet")
+    start_market_cap = tracked.get("market_cap_sol")
+
+    cursor.execute("""
+    SELECT
+        COUNT(*) AS total_trades,
+        SUM(CASE WHEN tx_type = 'buy' THEN 1 ELSE 0 END) AS buy_count,
+        SUM(CASE WHEN tx_type = 'sell' THEN 1 ELSE 0 END) AS sell_count,
+        COUNT(DISTINCT trader_public_key) AS unique_traders,
+        COUNT(DISTINCT CASE WHEN tx_type = 'buy' THEN trader_public_key END) AS unique_buyers,
+        COUNT(DISTINCT CASE WHEN tx_type = 'sell' THEN trader_public_key END) AS unique_sellers,
+        COALESCE(SUM(sol_amount), 0) AS total_volume_sol,
+        COALESCE(SUM(CASE WHEN tx_type = 'buy' THEN sol_amount ELSE 0 END), 0) AS buy_volume_sol,
+        COALESCE(SUM(CASE WHEN tx_type = 'sell' THEN sol_amount ELSE 0 END), 0) AS sell_volume_sol,
+        AVG(CASE WHEN tx_type = 'buy' THEN sol_amount END) AS average_buy_sol,
+        AVG(CASE WHEN tx_type = 'sell' THEN sol_amount END) AS average_sell_sol,
+        MAX(CASE WHEN tx_type = 'buy' THEN sol_amount END) AS largest_buy_sol,
+        MAX(CASE WHEN tx_type = 'sell' THEN sol_amount END) AS largest_sell_sol,
+        MAX(market_cap_sol) AS highest_market_cap_sol,
+        MIN(market_cap_sol) AS lowest_market_cap_sol,
+        MIN(seconds_after_launch) AS first_trade_seconds,
+        MIN(CASE WHEN tx_type = 'buy' THEN seconds_after_launch END) AS first_buy_seconds,
+        MIN(CASE WHEN tx_type = 'sell' THEN seconds_after_launch END) AS first_sell_seconds
+    FROM pump_token_trades
+    WHERE mint = %s
+      AND collection_run_id = %s
+      AND seconds_after_launch <= %s
+    """, (mint, COLLECTION_RUN_ID, seconds_after_launch))
+    row = cursor.fetchone()
+
+    total_trades = int(row["total_trades"] or 0)
+    buy_count = int(row["buy_count"] or 0)
+    sell_count = int(row["sell_count"] or 0)
+    unique_traders = int(row["unique_traders"] or 0)
+    unique_buyers = int(row["unique_buyers"] or 0)
+    unique_sellers = int(row["unique_sellers"] or 0)
+
+    total_volume_sol = float(row["total_volume_sol"] or 0)
+    buy_volume_sol = float(row["buy_volume_sol"] or 0)
+    sell_volume_sol = float(row["sell_volume_sol"] or 0)
+    net_volume_sol = buy_volume_sol - sell_volume_sol
+
+    cursor.execute("""
+    SELECT market_cap_sol
+    FROM pump_token_trades
+    WHERE mint = %s
+      AND collection_run_id = %s
+      AND seconds_after_launch <= %s
+      AND market_cap_sol IS NOT NULL
+    ORDER BY seconds_after_launch DESC
+    LIMIT 1
+    """, (mint, COLLECTION_RUN_ID, seconds_after_launch))
+    current_row = cursor.fetchone()
+    current_market_cap = current_row["market_cap_sol"] if current_row else tracked.get("market_cap_sol")
+
+    market_cap_change_sol = None
+    market_cap_change_percent = None
+    if start_market_cap is not None and current_market_cap is not None:
+        start_mc = float(start_market_cap)
+        current_mc = float(current_market_cap)
+        market_cap_change_sol = current_mc - start_mc
+        if start_mc != 0:
+            market_cap_change_percent = (market_cap_change_sol / start_mc) * 100
+
+    buy_sell_ratio = calculate_ratio(buy_count, sell_count)
+    buy_volume_sell_volume_ratio = calculate_ratio(buy_volume_sol, sell_volume_sol)
+
+    volume_speed = total_volume_sol / seconds_after_launch if seconds_after_launch > 0 else None
+    trade_speed = total_trades / seconds_after_launch if seconds_after_launch > 0 else None
+    buy_speed = buy_count / seconds_after_launch if seconds_after_launch > 0 else None
+    sell_speed = sell_count / seconds_after_launch if seconds_after_launch > 0 else None
+
+    creator_buy_count = 0
+    creator_sell_count = 0
+    creator_buy_volume = 0
+    creator_sell_volume = 0
+
+    if creator_wallet:
+        cursor.execute("""
+        SELECT
+            SUM(CASE WHEN tx_type = 'buy' THEN 1 ELSE 0 END) AS creator_buy_count,
+            SUM(CASE WHEN tx_type = 'sell' THEN 1 ELSE 0 END) AS creator_sell_count,
+            COALESCE(SUM(CASE WHEN tx_type = 'buy' THEN sol_amount ELSE 0 END), 0) AS creator_buy_volume,
+            COALESCE(SUM(CASE WHEN tx_type = 'sell' THEN sol_amount ELSE 0 END), 0) AS creator_sell_volume
+        FROM pump_token_trades
+        WHERE mint = %s
+          AND collection_run_id = %s
+          AND trader_public_key = %s
+          AND seconds_after_launch <= %s
+        """, (mint, COLLECTION_RUN_ID, creator_wallet, seconds_after_launch))
+        creator_row = cursor.fetchone()
+
+        creator_buy_count = int(creator_row["creator_buy_count"] or 0)
+        creator_sell_count = int(creator_row["creator_sell_count"] or 0)
+        creator_buy_volume = float(creator_row["creator_buy_volume"] or 0)
+        creator_sell_volume = float(creator_row["creator_sell_volume"] or 0)
+
+    creator_sold = creator_sell_count > 0
+
+    cursor.execute("""
+    SELECT trader_public_key, SUM(sol_amount) AS total_buy_sol
+    FROM pump_token_trades
+    WHERE mint = %s
+      AND collection_run_id = %s
+      AND tx_type = 'buy'
+      AND seconds_after_launch <= %s
+    GROUP BY trader_public_key
+    ORDER BY total_buy_sol DESC
+    LIMIT 1
+    """, (mint, COLLECTION_RUN_ID, seconds_after_launch))
+    top_buyer_row = cursor.fetchone()
+    top_buyer_sol = float(top_buyer_row["total_buy_sol"] or 0) if top_buyer_row else 0
+    top_buyer_share_percent = (top_buyer_sol / buy_volume_sol * 100) if buy_volume_sol > 0 else None
+
+    cursor.execute("""
+    SELECT trader_public_key, SUM(sol_amount) AS total_sell_sol
+    FROM pump_token_trades
+    WHERE mint = %s
+      AND collection_run_id = %s
+      AND tx_type = 'sell'
+      AND seconds_after_launch <= %s
+    GROUP BY trader_public_key
+    ORDER BY total_sell_sol DESC
+    LIMIT 1
+    """, (mint, COLLECTION_RUN_ID, seconds_after_launch))
+    top_seller_row = cursor.fetchone()
+    top_seller_sol = float(top_seller_row["total_sell_sol"] or 0) if top_seller_row else 0
+    top_seller_share_percent = (top_seller_sol / sell_volume_sol * 100) if sell_volume_sol > 0 else None
+
+    largest_buy_sol = row["largest_buy_sol"]
+    largest_sell_sol = row["largest_sell_sol"]
+
+    has_large_buy = bool(largest_buy_sol is not None and float(largest_buy_sol) >= 1.0)
+    has_large_sell = bool(largest_sell_sol is not None and float(largest_sell_sol) >= 1.0)
+    is_sell_pressure_high = bool(sell_volume_sol > buy_volume_sol or sell_count > buy_count)
+    has_no_sells = sell_count == 0
+    is_high_activity = bool(total_trades >= 10 or unique_traders >= 5 or buy_volume_sol >= 1)
+
+    buy_pressure_score = (buy_count * 1.0) + (unique_buyers * 2.0) + (buy_volume_sol * 5.0)
+    sell_pressure_score = (sell_count * 1.5) + (unique_sellers * 2.0) + (sell_volume_sol * 6.0)
+    mc_component = float(market_cap_change_percent or 0)
+    momentum_score = buy_pressure_score + mc_component - sell_pressure_score
+
+    risk_score = 0
+    if creator_sold:
+        risk_score += 50
+    if has_large_sell:
+        risk_score += 25
+    if is_sell_pressure_high:
+        risk_score += 25
+    if top_buyer_share_percent is not None and top_buyer_share_percent >= 80:
+        risk_score += 20
+
+    cursor.execute("""
+    INSERT INTO pump_token_snapshots (
+        collection_run_id, tracked_token_id, mint, seconds_after_launch,
+        total_trades, buy_count, sell_count,
+        unique_traders, unique_buyers, unique_sellers,
+        total_volume_sol, buy_volume_sol, sell_volume_sol, net_volume_sol,
+        average_buy_sol, average_sell_sol, largest_buy_sol, largest_sell_sol,
+        start_market_cap_sol, current_market_cap_sol, highest_market_cap_sol, lowest_market_cap_sol,
+        market_cap_change_sol, market_cap_change_percent,
+        buy_sell_ratio, buy_volume_sell_volume_ratio,
+        volume_speed_sol_per_second, trade_speed_per_second, buy_speed_per_second, sell_speed_per_second,
+        first_trade_seconds, first_buy_seconds, first_sell_seconds,
+        creator_buy_count, creator_sell_count, creator_buy_volume_sol, creator_sell_volume_sol, creator_sold,
+        top_buyer_sol, top_seller_sol, top_buyer_share_percent, top_seller_share_percent,
+        has_large_buy, has_large_sell, is_high_activity, is_sell_pressure_high, has_no_sells,
+        buy_pressure_score, sell_pressure_score, momentum_score, risk_score
+    )
+    VALUES (
+        %s, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s,
+        %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s
+    )
+    ON DUPLICATE KEY UPDATE
+        total_trades = VALUES(total_trades),
+        buy_count = VALUES(buy_count),
+        sell_count = VALUES(sell_count),
+        unique_traders = VALUES(unique_traders),
+        unique_buyers = VALUES(unique_buyers),
+        unique_sellers = VALUES(unique_sellers),
+        total_volume_sol = VALUES(total_volume_sol),
+        buy_volume_sol = VALUES(buy_volume_sol),
+        sell_volume_sol = VALUES(sell_volume_sol),
+        net_volume_sol = VALUES(net_volume_sol),
+        current_market_cap_sol = VALUES(current_market_cap_sol),
+        highest_market_cap_sol = VALUES(highest_market_cap_sol),
+        lowest_market_cap_sol = VALUES(lowest_market_cap_sol),
+        market_cap_change_sol = VALUES(market_cap_change_sol),
+        market_cap_change_percent = VALUES(market_cap_change_percent),
+        creator_sold = VALUES(creator_sold),
+        creator_sell_volume_sol = VALUES(creator_sell_volume_sol),
+        top_buyer_share_percent = VALUES(top_buyer_share_percent),
+        top_seller_share_percent = VALUES(top_seller_share_percent),
+        is_sell_pressure_high = VALUES(is_sell_pressure_high),
+        buy_pressure_score = VALUES(buy_pressure_score),
+        sell_pressure_score = VALUES(sell_pressure_score),
+        momentum_score = VALUES(momentum_score),
+        risk_score = VALUES(risk_score)
+    """, (
+        COLLECTION_RUN_ID, tracked_token_id, mint, seconds_after_launch,
+        total_trades, buy_count, sell_count,
+        unique_traders, unique_buyers, unique_sellers,
+        total_volume_sol, buy_volume_sol, sell_volume_sol, net_volume_sol,
+        row["average_buy_sol"], row["average_sell_sol"], largest_buy_sol, largest_sell_sol,
+        start_market_cap, current_market_cap, row["highest_market_cap_sol"], row["lowest_market_cap_sol"],
+        market_cap_change_sol, market_cap_change_percent,
+        buy_sell_ratio, buy_volume_sell_volume_ratio,
+        volume_speed, trade_speed, buy_speed, sell_speed,
+        row["first_trade_seconds"], row["first_buy_seconds"], row["first_sell_seconds"],
+        creator_buy_count, creator_sell_count, creator_buy_volume, creator_sell_volume, creator_sold,
+        top_buyer_sol, top_seller_sol, top_buyer_share_percent, top_seller_share_percent,
+        has_large_buy, has_large_sell, is_high_activity, is_sell_pressure_high, has_no_sells,
+        buy_pressure_score, sell_pressure_score, momentum_score, risk_score
+    ))
+    mydb.commit()
+
+    current_mc_usd = market_cap_usd_from_sol(to_float(current_market_cap))
+
+    print(
+        "Snapshot:", seconds_after_launch, "s |",
+        mint,
+        "| MC USD:", round(current_mc_usd or 0, 2),
+        "| buyers:", unique_buyers,
+        "| net:", round(net_volume_sol, 4),
+        "| creator_sold:", creator_sold,
+        "| risk:", risk_score
+    )
+
+    return {
+        "mint": mint,
+        "tracked_token_id": tracked_token_id,
+        "seconds_after_launch": seconds_after_launch,
+        "current_market_cap_sol": to_float(current_market_cap),
+        "current_market_cap_usd": current_mc_usd,
+        "highest_market_cap_sol": to_float(row["highest_market_cap_sol"]),
+        "lowest_market_cap_sol": to_float(row["lowest_market_cap_sol"]),
+        "total_trades": total_trades,
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "unique_traders": unique_traders,
+        "unique_buyers": unique_buyers,
+        "unique_sellers": unique_sellers,
+        "buy_volume_sol": buy_volume_sol,
+        "sell_volume_sol": sell_volume_sol,
+        "net_volume_sol": net_volume_sol,
+        "creator_sold": creator_sold,
+        "creator_sell_volume_sol": creator_sell_volume,
+        "top_buyer_share_percent": top_buyer_share_percent,
+        "top_seller_share_percent": top_seller_share_percent,
+        "momentum_score": momentum_score,
+        "risk_score": risk_score,
+    }
+
+
+# =====================================================
+# 5–10 MINUTE RESEARCH RESULT LOGIC
+# =====================================================
+
+def create_entry_result(mint: str, tracked_token_id: int, snapshot: Dict[str, Any]):
+    mc_usd = float(snapshot.get("current_market_cap_usd") or 0)
+    flags = threshold_flags(mc_usd)
+
+    cursor.execute("SELECT * FROM pump_tracked_tokens WHERE id = %s LIMIT 1", (tracked_token_id,))
+    tracked = cursor.fetchone()
+    if not tracked:
+        return
+
+    cursor.execute("""
+    INSERT INTO pump_5_10_trade_research_results (
+        collection_run_id, mint, token_name, symbol, creator_wallet, launch_time,
+        entry_time_seconds, entry_market_cap_sol, entry_market_cap_usd, entry_threshold_label,
+        passed_5k, passed_7500, passed_10k,
+        entry_buy_count, entry_sell_count, entry_unique_buyers, entry_unique_sellers,
+        entry_buy_volume_sol, entry_sell_volume_sol, entry_net_volume_sol,
+        entry_top_buyer_share_percent, entry_top_seller_share_percent,
+        entry_creator_sold, entry_creator_sell_volume_sol,
+        creator_previous_launches, creator_previous_migrations,
+        entry_risk_score, entry_momentum_score,
+        max_market_cap_usd_5_to_10, min_market_cap_usd_5_to_10,
+        best_return_percent_5_to_10, worst_drawdown_percent_5_to_10,
+        best_exit_seconds, best_exit_label,
+        final_status, notes
+    )
+    VALUES (
+        %s, %s, %s, %s, %s, %s,
+        300, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s, %s,
+        %s, %s,
+        %s, %s,
+        %s, %s,
+        %s, %s,
+        %s, %s,
+        0, 0,
+        300, '5:00',
+        'active_5_to_10_candidate', %s
+    )
+    ON DUPLICATE KEY UPDATE
+        entry_market_cap_sol = VALUES(entry_market_cap_sol),
+        entry_market_cap_usd = VALUES(entry_market_cap_usd),
+        entry_threshold_label = VALUES(entry_threshold_label),
+        passed_5k = VALUES(passed_5k),
+        passed_7500 = VALUES(passed_7500),
+        passed_10k = VALUES(passed_10k),
+        entry_creator_sold = VALUES(entry_creator_sold),
+        entry_creator_sell_volume_sol = VALUES(entry_creator_sell_volume_sol),
+        entry_risk_score = VALUES(entry_risk_score),
+        entry_momentum_score = VALUES(entry_momentum_score),
+        final_status = 'active_5_to_10_candidate'
+    """, (
+        COLLECTION_RUN_ID, mint, tracked.get("token_name"), tracked.get("symbol"),
+        tracked.get("creator_wallet"), tracked.get("launch_time"),
+        snapshot.get("current_market_cap_sol"), mc_usd, threshold_label(mc_usd),
+        flags["passed_5k"], flags["passed_7500"], flags["passed_10k"],
+        snapshot.get("buy_count"), snapshot.get("sell_count"),
+        snapshot.get("unique_buyers"), snapshot.get("unique_sellers"),
+        snapshot.get("buy_volume_sol"), snapshot.get("sell_volume_sol"),
+        snapshot.get("net_volume_sol"), snapshot.get("top_buyer_share_percent"),
+        snapshot.get("top_seller_share_percent"), snapshot.get("creator_sold"),
+        snapshot.get("creator_sell_volume_sol"),
+        tracked.get("creator_previous_launches"), tracked.get("creator_previous_migrations"),
+        snapshot.get("risk_score"), snapshot.get("momentum_score"),
+        mc_usd, mc_usd,
+        "coin passed at least $5k threshold at 5 minutes"
+    ))
+    mydb.commit()
+
+    print("5-MIN CANDIDATE:", mint, "| MC USD:", round(mc_usd, 2), "| tier:", threshold_label(mc_usd))
+
+
+def update_result_between_5_and_10(mint: str, seconds_after_launch: int, snapshot: Dict[str, Any]):
+    mc_usd = float(snapshot.get("current_market_cap_usd") or 0)
+
+    cursor.execute("""
+    SELECT *
+    FROM pump_5_10_trade_research_results
+    WHERE collection_run_id = %s AND mint = %s
+    LIMIT 1
+    """, (COLLECTION_RUN_ID, mint))
+    result = cursor.fetchone()
+
+    if not result:
+        return
+
+    entry_mc = float(result["entry_market_cap_usd"] or 0)
+    if entry_mc <= 0:
+        return
+
+    current_return = ((mc_usd - entry_mc) / entry_mc) * 100
+
+    old_max_mc = float(result["max_market_cap_usd_5_to_10"] or entry_mc)
+    old_min_mc = float(result["min_market_cap_usd_5_to_10"] or entry_mc)
+
+    new_max_mc = max(old_max_mc, mc_usd)
+    new_min_mc = min(old_min_mc, mc_usd)
+
+    best_return = ((new_max_mc - entry_mc) / entry_mc) * 100
+    worst_drawdown = ((new_min_mc - entry_mc) / entry_mc) * 100
+
+    # Keep previous best exit unless this snapshot creates a new max market cap.
+    best_exit_seconds = result["best_exit_seconds"]
+    best_exit_label = result["best_exit_label"]
+    if mc_usd >= old_max_mc:
+        best_exit_seconds = seconds_after_launch
+        best_exit_label = seconds_to_label(seconds_after_launch)
+
+    hit_plus_15 = bool(result["hit_plus_15"] or current_return >= 15)
+    hit_plus_20 = bool(result["hit_plus_20"] or current_return >= 20)
+    hit_plus_30 = bool(result["hit_plus_30"] or current_return >= 30)
+
+    first_hit_15 = result["first_hit_15_seconds"]
+    first_hit_20 = result["first_hit_20_seconds"]
+    first_hit_30 = result["first_hit_30_seconds"]
+
+    if first_hit_15 is None and current_return >= 15:
+        first_hit_15 = seconds_after_launch
+    if first_hit_20 is None and current_return >= 20:
+        first_hit_20 = seconds_after_launch
+    if first_hit_30 is None and current_return >= 30:
+        first_hit_30 = seconds_after_launch
+
+    hit_stop_15 = bool(result["hit_stop_minus_15"] or current_return <= -15)
+    hit_stop_20 = bool(result["hit_stop_minus_20"] or current_return <= -20)
+    hit_stop_30 = bool(result["hit_stop_minus_30"] or current_return <= -30)
+
+    first_stop_15 = result["first_stop_15_seconds"]
+    first_stop_20 = result["first_stop_20_seconds"]
+    first_stop_30 = result["first_stop_30_seconds"]
+
+    if first_stop_15 is None and current_return <= -15:
+        first_stop_15 = seconds_after_launch
+    if first_stop_20 is None and current_return <= -20:
+        first_stop_20 = seconds_after_launch
+    if first_stop_30 is None and current_return <= -30:
+        first_stop_30 = seconds_after_launch
+
+    dropped_below_5k = bool(result["dropped_below_5k"] or mc_usd < THRESHOLD_5K)
+    dropped_below_7500 = bool(result["dropped_below_7500"] or mc_usd < THRESHOLD_7500)
+    dropped_below_10k = bool(result["dropped_below_10k"] or mc_usd < THRESHOLD_10K)
+
+    final_10m_market_cap_usd = result["final_10m_market_cap_usd"]
+    final_10m_return_percent = result["final_10m_return_percent"]
+    final_10m_above_5k = result["final_10m_above_5k"]
+    final_10m_above_7500 = result["final_10m_above_7500"]
+    final_10m_above_10k = result["final_10m_above_10k"]
+    final_status = result["final_status"]
+
+    if seconds_after_launch == TEN_MIN_SECONDS:
+        final_10m_market_cap_usd = mc_usd
+        final_10m_return_percent = current_return
+        final_10m_above_5k = mc_usd >= THRESHOLD_5K
+        final_10m_above_7500 = mc_usd >= THRESHOLD_7500
+        final_10m_above_10k = mc_usd >= THRESHOLD_10K
+
+        if hit_plus_30:
+            final_status = "hit_plus_30_before_10m"
+        elif hit_plus_20:
+            final_status = "hit_plus_20_before_10m"
+        elif hit_plus_15:
+            final_status = "hit_plus_15_before_10m"
+        elif final_10m_above_5k:
+            final_status = "survived_above_5k_at_10m_no_target"
+        else:
+            final_status = "failed_before_10m"
+
+    cursor.execute("""
+    UPDATE pump_5_10_trade_research_results
+    SET
+        max_market_cap_usd_5_to_10 = %s,
+        min_market_cap_usd_5_to_10 = %s,
+        best_return_percent_5_to_10 = %s,
+        worst_drawdown_percent_5_to_10 = %s,
+        best_exit_seconds = %s,
+        best_exit_label = %s,
+
+        hit_plus_15 = %s,
+        hit_plus_20 = %s,
+        hit_plus_30 = %s,
+        first_hit_15_seconds = %s,
+        first_hit_20_seconds = %s,
+        first_hit_30_seconds = %s,
+
+        hit_stop_minus_15 = %s,
+        hit_stop_minus_20 = %s,
+        hit_stop_minus_30 = %s,
+        first_stop_15_seconds = %s,
+        first_stop_20_seconds = %s,
+        first_stop_30_seconds = %s,
+
+        dropped_below_5k = %s,
+        dropped_below_7500 = %s,
+        dropped_below_10k = %s,
+
+        final_10m_market_cap_usd = %s,
+        final_10m_return_percent = %s,
+        final_10m_above_5k = %s,
+        final_10m_above_7500 = %s,
+        final_10m_above_10k = %s,
+        final_status = %s
+    WHERE collection_run_id = %s AND mint = %s
+    """, (
+        new_max_mc, new_min_mc, best_return, worst_drawdown,
+        best_exit_seconds, best_exit_label,
+        hit_plus_15, hit_plus_20, hit_plus_30,
+        first_hit_15, first_hit_20, first_hit_30,
+        hit_stop_15, hit_stop_20, hit_stop_30,
+        first_stop_15, first_stop_20, first_stop_30,
+        dropped_below_5k, dropped_below_7500, dropped_below_10k,
+        final_10m_market_cap_usd, final_10m_return_percent,
+        final_10m_above_5k, final_10m_above_7500, final_10m_above_10k,
+        final_status,
+        COLLECTION_RUN_ID, mint
+    ))
+    mydb.commit()
+
+    print(
+        "5-10 update:", mint,
+        "|", seconds_to_label(seconds_after_launch),
+        "| MC USD:", round(mc_usd, 2),
+        "| return:", round(current_return, 2), "%"
+    )
+
+
+def seconds_to_label(seconds: int) -> str:
+    minutes = seconds // 60
+    remaining = seconds % 60
+    return f"{minutes}:{remaining:02d}"
+
+
+def should_track_launch(info: Dict[str, Any]) -> bool:
+    if TRACK_ALL_LAUNCHES_UNTIL_5_MIN:
+        return True
+
+    sol_amount = info.get("sol_amount") or 0
+    market_cap_sol = info.get("market_cap_sol") or 0
+
+    return (
+        sol_amount >= MIN_SOL_AMOUNT_TO_TRACK
+        or market_cap_sol >= MIN_LAUNCH_MARKET_CAP_SOL_TO_TRACK
+    )
+
+
+# =====================================================
+# ASYNC SCHEDULER
+# =====================================================
+
+async def research_snapshot_scheduler(
+    websocket,
+    mint: str,
+    tracked_token_id: int,
+    active_mints: Set[str],
+    candidate_mints: Set[str],
+    tracked_token_id_by_mint: Dict[str, int],
+    launch_time_ts_by_mint: Dict[str, float],
+    trade_sequence_by_mint: Dict[str, int],
+):
+    previous = 0
+    is_candidate = False
+
+    for window in SNAPSHOT_WINDOWS:
+        await asyncio.sleep(max(0, window - previous))
+
+        snapshot = save_snapshot(mint, tracked_token_id, window)
+        if not snapshot:
+            previous = window
+            continue
+
+        if window == FIVE_MIN_SECONDS:
+            mc_usd = float(snapshot.get("current_market_cap_usd") or 0)
+
+            if mc_usd >= THRESHOLD_5K:
+                is_candidate = True
+                candidate_mints.add(mint)
+                create_entry_result(mint, tracked_token_id, snapshot)
+                update_result_between_5_and_10(mint, window, snapshot)
+                print("Continuing 5–10 research candidate:", mint)
+            else:
+                # Below $5k at 5m: stop tracking this coin.
+                await safe_unsubscribe(websocket, mint)
+                cleanup_mint(
+                    mint, active_mints, candidate_mints,
+                    tracked_token_id_by_mint, launch_time_ts_by_mint,
+                    trade_sequence_by_mint
+                )
+                complete_tracked_token(mint)
+                print("Stopped below-$5k coin at 5m:", mint)
+                return
+
+        elif window > FIVE_MIN_SECONDS and is_candidate:
+            update_result_between_5_and_10(mint, window, snapshot)
+
+        previous = window
+
+    await safe_unsubscribe(websocket, mint)
+    cleanup_mint(
+        mint, active_mints, candidate_mints,
+        tracked_token_id_by_mint, launch_time_ts_by_mint,
+        trade_sequence_by_mint
+    )
+    complete_tracked_token(mint)
+    print("Completed 5–10 research tracking:", mint)
+
+
+async def safe_unsubscribe(websocket, mint: str):
+    try:
+        await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [mint]}))
+    except Exception as error:
+        print("Unsubscribe error:", mint, "|", error)
+
+
+def cleanup_mint(
+    mint: str,
+    active_mints: Set[str],
+    candidate_mints: Set[str],
+    tracked_token_id_by_mint: Dict[str, int],
+    launch_time_ts_by_mint: Dict[str, float],
+    trade_sequence_by_mint: Dict[str, int],
+):
+    active_mints.discard(mint)
+    candidate_mints.discard(mint)
+    tracked_token_id_by_mint.pop(mint, None)
+    launch_time_ts_by_mint.pop(mint, None)
+    trade_sequence_by_mint.pop(mint, None)
+
+
+# =====================================================
+# MAIN COLLECTOR
+# =====================================================
+
+async def run_collector():
+    check_required_tables()
+    ensure_research_result_table()
+
+    if not PUMPPORTAL_API_KEY or PUMPPORTAL_API_KEY.startswith("PUT_"):
+        raise Exception("Add your real PumpPortal API key before running.")
+
+    tracked_token_id_by_mint: Dict[str, int] = {}
+    launch_time_ts_by_mint: Dict[str, float] = {}
+    trade_sequence_by_mint: Dict[str, int] = {}
+
+    active_mints: Set[str] = set()
+    candidate_mints: Set[str] = set()
+    pending_tasks: List[asyncio.Task] = []
+
+    total_launches = 0
+    total_tracked = 0
+    paid_trade_message_count = 0
+
+    loop = asyncio.get_running_loop()
+    start_time = loop.time()
+    launch_collection_end = start_time + LAUNCH_COLLECTION_SECONDS
+
+    print("Connected to MySQL.")
+    print("Database:", MYSQL_CONFIG["database"])
+    print("Collection run:", COLLECTION_RUN_ID)
+    print("Launch collection seconds:", LAUNCH_COLLECTION_SECONDS)
+    print("Thresholds:", THRESHOLD_5K, THRESHOLD_7500, THRESHOLD_10K)
+    print("Snapshot windows:", SNAPSHOT_WINDOWS)
+
+    async with websockets.connect(PUMPPORTAL_URL, ping_interval=20, ping_timeout=20) as websocket:
+        print("Connected to PumpPortal WebSocket.")
+
+        await websocket.send(json.dumps({"method": "subscribeNewToken"}))
+        print("Subscribed to new token events.")
+
+        await websocket.send(json.dumps({"method": "subscribeMigration"}))
+        print("Subscribed to migration events.")
+
+        while True:
+            current_loop_time = loop.time()
+            launch_window_open = current_loop_time < launch_collection_end
+
+            if not launch_window_open and len(active_mints) == 0:
+                print("Launch window closed and all active tracking finished.")
+                break
+
+            try:
+                message = await asyncio.wait_for(websocket.recv(), timeout=5)
+                data = json.loads(message)
+            except asyncio.TimeoutError:
+                continue
+            except json.JSONDecodeError:
+                print("Received non-JSON message.")
+                continue
+            except Exception as error:
+                print("WebSocket error:", error)
+                continue
+
+            if data.get("message"):
+                print("Info:", data.get("message"))
+                continue
+
+            tx_type = data.get("txType")
+            mint = data.get("mint")
+            received_at = now_datetime()
+
+            if not mint:
+                continue
+
+            if tx_type == "create":
+                if not launch_window_open:
+                    continue
+
+                total_launches += 1
+
+                raw_event_id = save_raw_event("launch", mint, received_at, data)
+                launch_info = save_launch(data, raw_event_id, received_at)
+                if not launch_info:
+                    continue
+
+                if total_tracked >= MAX_TOTAL_TRACKED_TOKENS:
+                    print("Max total tracked reached. Not tracking new token:", mint)
+                    continue
+
+                if len(active_mints) >= MAX_ACTIVE_TRACKED_TOKENS:
+                    print("Max active tracked reached. Not tracking new token:", mint)
+                    continue
+
+                if not should_track_launch(launch_info):
+                    continue
+
+                tracked_token_id = insert_tracked_token(launch_info, "5_10_threshold_research")
+                if not tracked_token_id:
+                    continue
+
+                await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+
+                tracked_token_id_by_mint[mint] = tracked_token_id
+                launch_time_ts_by_mint[mint] = time.time()
+                trade_sequence_by_mint[mint] = 0
+                active_mints.add(mint)
+                total_tracked += 1
+
+                print(
+                    "Tracking until 5m:",
+                    mint,
+                    "| active:", len(active_mints),
+                    "| total tracked:", total_tracked
+                )
+
+                pending_tasks.append(asyncio.create_task(research_snapshot_scheduler(
+                    websocket,
+                    mint,
+                    tracked_token_id,
+                    active_mints,
+                    candidate_mints,
+                    tracked_token_id_by_mint,
+                    launch_time_ts_by_mint,
+                    trade_sequence_by_mint,
+                )))
+
+            elif tx_type in ["buy", "sell"]:
+                if mint in tracked_token_id_by_mint:
+                    paid_trade_message_count += 1
+                    save_token_trade(
+                        data,
+                        tracked_token_id_by_mint,
+                        launch_time_ts_by_mint,
+                        trade_sequence_by_mint
+                    )
+
+                    if paid_trade_message_count % 500 == 0:
+                        estimated_sol_used = paid_trade_message_count * 0.000001
+                        print(
+                            "Paid messages:", paid_trade_message_count,
+                            "| estimated SOL:", round(estimated_sol_used, 6),
+                            "| active:", len(active_mints),
+                            "| candidates:", len(candidate_mints)
+                        )
+
+            else:
+                raw_event_id = save_raw_event("migration", mint, received_at, data)
+                save_migration(data, raw_event_id, received_at)
+
+        if pending_tasks:
+            print("Waiting for snapshot tasks...")
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    print_run_summary(total_launches, total_tracked, paid_trade_message_count)
+
+
+def print_run_summary(total_launches: int, total_tracked: int, paid_trade_message_count: int):
+    estimated_sol_used = paid_trade_message_count * 0.000001
+
+    print("\n==============================")
+    print("RUN FINISHED")
+    print("==============================")
+    print("Collection run:", COLLECTION_RUN_ID)
+    print("Total launches:", total_launches)
+    print("Total tracked:", total_tracked)
+    print("Paid trade messages:", paid_trade_message_count)
+    print("Estimated SOL used:", round(estimated_sol_used, 6))
+
+    cursor.execute("""
+    SELECT
+        COUNT(*) AS candidates,
+        SUM(CASE WHEN passed_5k = TRUE THEN 1 ELSE 0 END) AS passed_5k,
+        SUM(CASE WHEN passed_7500 = TRUE THEN 1 ELSE 0 END) AS passed_7500,
+        SUM(CASE WHEN passed_10k = TRUE THEN 1 ELSE 0 END) AS passed_10k,
+        SUM(CASE WHEN hit_plus_15 = TRUE THEN 1 ELSE 0 END) AS hit_plus_15,
+        SUM(CASE WHEN hit_plus_20 = TRUE THEN 1 ELSE 0 END) AS hit_plus_20,
+        SUM(CASE WHEN hit_plus_30 = TRUE THEN 1 ELSE 0 END) AS hit_plus_30
+    FROM pump_5_10_trade_research_results
+    WHERE collection_run_id = %s
+    """, (COLLECTION_RUN_ID,))
+    summary = cursor.fetchone()
+
+    print("5m candidates:", summary["candidates"] or 0)
+    print("Passed $5k:", summary["passed_5k"] or 0)
+    print("Passed $7.5k:", summary["passed_7500"] or 0)
+    print("Passed $10k:", summary["passed_10k"] or 0)
+    print("Hit +15%:", summary["hit_plus_15"] or 0)
+    print("Hit +20%:", summary["hit_plus_20"] or 0)
+    print("Hit +30%:", summary["hit_plus_30"] or 0)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_collector())
+    finally:
+        try:
+            cursor.close()
+            mydb.close()
+        except Exception:
+            pass
