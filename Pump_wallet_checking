@@ -1,0 +1,33 @@
+import requests
+
+WALLET_ADDRESS = "GfHECaTChWwBjmsLbvWhK76kXWciwa4pyArzGPJuytv"
+
+RPC_URL = "https://api.mainnet-beta.solana.com"
+
+payload = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "getBalance",
+    "params": [WALLET_ADDRESS.strip()]
+}
+
+try:
+    response = requests.post(RPC_URL, json=payload, timeout=20)
+    data = response.json()
+
+    print("Full RPC response:")
+    print(data)
+
+    if "error" in data:
+        print("\nRPC error:")
+        print(data["error"]["message"])
+    elif "result" in data:
+        lamports = data["result"]["value"]
+        sol = lamports / 1_000_000_000
+        print(f"\nSOL balance: {sol}")
+    else:
+        print("\nUnexpected response. No result or error found.")
+
+except Exception as e:
+    print("Request failed:")
+    print(e)
