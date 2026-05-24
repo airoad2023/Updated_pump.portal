@@ -1,0 +1,179 @@
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# =====================================================
+# SETTINGS
+# =====================================================
+
+SCRIPT_TO_RUN = r"D:\Downloads\pumpportal_5_10_threshold_research.py"
+
+# Lithuania / computer local time
+DAILY_RUN_TIMES = [
+    (10, 0),  # 10:00 - morning market activity test
+    (13, 0),  # 13:00 - strongest so far
+    (15, 0),  # 15:00 - useful 5m to 10m test data
+    (17, 0),  # 17:00 - Europe / early US activity test
+    (20, 0),  # 20:00 - evening / US overlap test
+]
+
+CHECK_EVERY_SECONDS = 30
+
+# Main script should normally run around 1 hour + 10 minutes
+MIN_EXPECTED_RUN_SECONDS = 20 * 60      # 20 minutes
+MAX_EXPECTED_RUN_SECONDS = 90 * 60      # 90 minutes
+
+MAX_RESTARTS_IF_CRASHED = 2
+RESTART_DELAY_SECONDS = 60
+
+
+# =====================================================
+# TIME LOGIC
+# =====================================================
+
+def get_next_run_time():
+    now = datetime.now()
+
+    today_targets = []
+
+    for hour, minute in DAILY_RUN_TIMES:
+        target = now.replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0
+        )
+        today_targets.append(target)
+
+    future_targets = [target for target in today_targets if target > now]
+
+    if future_targets:
+        return min(future_targets)
+
+    first_hour, first_minute = DAILY_RUN_TIMES[0]
+    tomorrow = now + timedelta(days=1)
+
+    return tomorrow.replace(
+        hour=first_hour,
+        minute=first_minute,
+        second=0,
+        microsecond=0
+    )
+
+
+def run_script_once(script_path):
+    print()
+    print("=" * 60)
+    print("Starting PumpPortal research script")
+    print("Time:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("Script:", script_path)
+    print("=" * 60)
+
+    start_time = time.time()
+
+    result = subprocess.run(
+        [sys.executable, str(script_path)],
+        cwd=str(script_path.parent)
+    )
+
+    end_time = time.time()
+    runtime_seconds = int(end_time - start_time)
+
+    print()
+    print("=" * 60)
+    print("Main script finished.")
+    print("Exit code:", result.returncode)
+    print("Runtime seconds:", runtime_seconds)
+    print("Finished at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("=" * 60)
+    print()
+
+    return result.returncode, runtime_seconds
+
+
+def run_script_with_restarts(script_path):
+    restart_count = 0
+
+    while True:
+        exit_code, runtime_seconds = run_script_once(script_path)
+
+        finished_normally = (
+            exit_code == 0
+            and runtime_seconds >= MIN_EXPECTED_RUN_SECONDS
+        )
+
+        if finished_normally:
+            print("Run completed normally.")
+            return
+
+        if runtime_seconds > MAX_EXPECTED_RUN_SECONDS:
+            print("Run lasted longer than expected, but it ended. Moving to next schedule.")
+            return
+
+        if restart_count >= MAX_RESTARTS_IF_CRASHED:
+            print("Max restart attempts reached. Moving to next scheduled time.")
+            return
+
+        restart_count += 1
+
+        print()
+        print("Script may have crashed or stopped too early.")
+        print(f"Restart attempt {restart_count}/{MAX_RESTARTS_IF_CRASHED}")
+        print(f"Waiting {RESTART_DELAY_SECONDS} seconds before restart...")
+        print()
+
+        time.sleep(RESTART_DELAY_SECONDS)
+
+
+def main():
+    script_path = Path(SCRIPT_TO_RUN)
+
+    if not script_path.exists():
+        print("ERROR: Script not found:")
+        print(script_path)
+        return
+
+    print("Daily launcher started.")
+    print("Current computer time:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("Script path:", script_path)
+    print("Daily run times:")
+
+    for hour, minute in DAILY_RUN_TIMES:
+        print(f"- {hour:02d}:{minute:02d}")
+
+    print()
+    print("Keep this launcher running.")
+    print("Press CTRL + C if you want to stop the launcher.")
+    print()
+
+    while True:
+        next_run_time = get_next_run_time()
+
+        print("Next run scheduled at:", next_run_time.strftime("%Y-%m-%d %H:%M:%S"))
+
+        while True:
+            now = datetime.now()
+
+            if now >= next_run_time:
+                break
+
+            remaining_seconds = int((next_run_time - now).total_seconds())
+            remaining_minutes = remaining_seconds // 60
+
+            print(
+                f"Waiting... {remaining_minutes} minutes / {remaining_seconds} seconds remaining",
+                end="\r"
+            )
+
+            time.sleep(CHECK_EVERY_SECONDS)
+
+        run_script_with_restarts(script_path)
+
+        time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
